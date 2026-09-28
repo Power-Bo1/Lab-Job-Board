@@ -1,0 +1,193 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # lets you re-run manually from the Actions tab
+
+jobs:
+  # ─────────────────────────────────────────────── stage 1: python lint + unit tests
+  lint-test-python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jobs-service    # so conftest.py is found and `app` is importable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install ruff
+      - name: Lint
+        run: ruff check app tests
+      - name: Unit tests (no database required)
+        run: pytest -v
+
+  # ─────────────────────────────────────────────── stage 2: node dependency audit
+  lint-test-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: applications-service — install + audit
+        working-directory: applications-service
+        run: |
+          npm ci --omit=dev
+          npm audit --omit=dev --audit-level=high
+      - name: frontend — install + audit
+        working-directory: frontend
+        run: |
+          npm ci --omit=dev
+          npm audit --omit=dev --audit-level=high
+
+  # ─────────────────────────────────────────────── stage 3: build all four images
+  build-images:
+    needs: [lint-test-python, lint-test-node]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create ephemeral .env
+        run: |
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" > .env
+          echo "NGINX_PORT=8080" >> .env
+          echo "COMPOSE_PROJECT_NAME=jobboard" >> .env
+      - name: Build
+        run: docker compose build
+      - name: Show image sizes
+        run: docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+      - name: Save images for the later stages
+        run: |
+          docker save jobboard-jobs-service:latest \
+                      jobboard-applications-service:latest \
+                      jobboard-frontend:latest \
+                      jobboard-nginx:latest | gzip > images.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: images.tar.gz
+          retention-days: 1
+
+  # ─────────────────────────────────────────────── stage 4: trivy scans
+  scan-images:
+    needs: build-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+      - name: Load images
+        run: gunzip -c images.tar.gz | docker load
+      - name: Scan (report-only gate)
+        run: |
+          mkdir -p reports
+          for svc in jobs-service applications-service frontend; do
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$PWD/reports:/reports" \
+              aquasec/trivy:latest image \
+                --exit-code 0 \
+                --format table \
+                --output "/reports/trivy-$svc.txt" \
+                "jobboard-$svc:latest"
+          done
+          ls -la reports/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports
+          path: reports/
+
+  # ─────────────────────────────────────────────── stage 5: integration test
+  integration-test:
+    needs: build-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+      - name: Load images
+        run: gunzip -c images.tar.gz | docker load
+      - name: Create ephemeral .env
+        run: |
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" > .env
+          echo "NGINX_PORT=8080" >> .env
+          echo "COMPOSE_PROJECT_NAME=jobboard" >> .env
+      - name: Start the stack
+        run: docker compose up -d --no-build
+      - name: Wait for all five containers to be healthy
+        run: |
+          for i in $(seq 1 40); do
+            ok=1
+            for c in jobboard-db jobs-service applications-service jobboard-frontend nginx-proxy; do
+              st=$(docker inspect --format '{{.State.Health.Status}}' "$c" 2>/dev/null || echo missing)
+              [ "$st" = "healthy" ] || ok=0
+            done
+            [ "$ok" = 1 ] && { echo "all healthy"; docker compose ps; exit 0; }
+            sleep 5
+          done
+          echo "timed out waiting for health"; docker compose ps; exit 1
+      - name: API assertions
+        run: |
+          set -e
+          BASE=http://localhost:8080
+
+          echo "1. seeded jobs are served"
+          curl -fsS "$BASE/api/jobs" | grep -q "Senior DevOps Engineer"
+
+          echo "2. creating a job returns 201"
+          code=$(curl -s -o /tmp/job.json -w '%{http_code}' -X POST "$BASE/api/jobs/" \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"CI Test Job","description":"created by the pipeline","company":"CI","location":"Remote"}')
+          [ "$code" = "201" ]
+          JOB_ID=$(python3 -c "import json;print(json.load(open('/tmp/job.json'))['id'])")
+
+          echo "3. the new job can be fetched back"
+          curl -fsS "$BASE/api/jobs/$JOB_ID" | grep -q "CI Test Job"
+
+          echo "4. submitting an application returns 201"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/applications/" \
+            -H 'Content-Type: application/json' \
+            -d "{\"job_id\":\"$JOB_ID\",\"applicant_name\":\"CI Bot\",\"applicant_email\":\"ci@example.com\"}")
+          [ "$code" = "201" ]
+
+          echo "5. the frontend is served through the proxy"
+          curl -fsS "$BASE/" | grep -q "JobBoard"
+
+          echo "all integration assertions passed"
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ─────────────────────────────────────────────── stage 6: push (main only)
+  push-to-registry:
+    needs: [scan-images, integration-test]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+      - name: Load images
+        run: gunzip -c images.tar.gz | docker load
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Tag and push
+        run: |
+          for svc in jobs-service applications-service frontend nginx; do
+            docker tag "jobboard-$svc:latest" "${{ secrets.DOCKERHUB_USERNAME }}/jobboard-$svc:latest"
+            docker tag "jobboard-$svc:latest" "${{ secrets.DOCKERHUB_USERNAME }}/jobboard-$svc:${{ github.sha }}"
+            docker push "${{ secrets.DOCKERHUB_USERNAME }}/jobboard-$svc:latest"
+            docker push "${{ secrets.DOCKERHUB_USERNAME }}/jobboard-$svc:${{ github.sha }}"
+          done

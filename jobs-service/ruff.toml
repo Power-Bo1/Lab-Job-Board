@@ -1,0 +1,11 @@
+target-version = "py312"
+
+[lint.flake8-bugbear]
+# FastAPI's dependency injection deliberately puts a call in the argument
+# default: `db: Session = Depends(get_db)`. B008 exists to catch accidental
+# shared/mutable defaults, which is not what this is — so Depends and friends
+# are declared safe instead of rewriting framework-idiomatic application code.
+extend-immutable-calls = [
+  "fastapi.Depends", "fastapi.Query", "fastapi.Path",
+  "fastapi.Body", "fastapi.Header",
+]

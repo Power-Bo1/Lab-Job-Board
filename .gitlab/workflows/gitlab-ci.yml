@@ -1,0 +1,209 @@
+# GitLab CI port of .github/workflows/ci.yml: same six jobs, same order, same checks.
+#
+# lint-test-python ─┐                   ┌─ scan-images ──────┐
+#                   ├─ build-images ────┤                    ├─ push-to-registry (main only)
+# lint-test-node ───┘                   └─ integration-test ─┘
+#
+# What had to change, and why (GitLab runs jobs differently from GitHub Actions):
+#   1. Docker jobs run against a Docker-in-Docker service (docker:dind). Ports that
+#      `docker compose` publishes land on that service container, so the integration
+#      test calls http://docker:8080 instead of http://localhost:8080.
+#   2. A GitLab job runs all its script lines in ONE shell. The health-wait loop
+#      therefore uses `break` (the GitHub version's `exit 0` would end the whole job
+#      as "passed" before the API assertions ran).
+#   3. Images are saved as one tarball per service, so Trivy can scan them straight
+#      from the artifact (`trivy image --input`) with no Docker daemon in that job.
+#   4. `if: failure()` / `if: always()` become `after_script` + $CI_JOB_STATUS.
+#
+# Setup (one time):
+#   - Push this repo to a GitLab project (or use GitLab's "Import project > GitHub").
+#   - Settings > CI/CD > Variables: add DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
+#     (mark the token Masked and Protected; main is protected by default).
+#   - New GitLab.com accounts must verify identity before shared runners pick up jobs.
+
+workflow:
+  rules:
+    # pull_request: branches: [main]
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+    # push: branches: [main]
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # workflow_dispatch: Build > Pipelines > Run pipeline
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+stages:
+  - lint-test-python
+  - lint-test-node
+  - build-images
+  - scan-images
+  - integration-test
+  - push-to-registry
+
+# Shared settings for every job that needs a Docker daemon.
+.docker:
+  image: docker:28-cli
+  services:
+    - docker:28-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"   # the docker image's entrypoint then points the CLI at the dind service over TLS
+  before_script:
+    - docker info --format 'Docker daemon {{.ServerVersion}} is up'
+
+# Throwaway .env for compose: a fresh random, URL-safe (hex) DB password every run.
+.make-env: &make-env
+  - echo "POSTGRES_PASSWORD=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > .env
+  - echo "NGINX_PORT=8080" >> .env
+  - echo "COMPOSE_PROJECT_NAME=jobboard" >> .env
+
+# ───────────────────────────────────────────── stage 1: python lint + unit tests
+lint-test-python:
+  stage: lint-test-python
+  image: python:3.12-slim
+  needs: []
+  script:
+    - cd jobs-service                      # so conftest.py is found and `app` is importable
+    - pip install -r requirements.txt -r requirements-dev.txt ruff
+    - ruff check app tests
+    - pytest -v --junitxml=report.xml      # no database required (conftest uses SQLite)
+  artifacts:
+    when: always
+    reports:
+      junit: jobs-service/report.xml       # test results show up in the pipeline's Tests tab
+    expire_in: 1 week
+
+# ───────────────────────────────────────────── stage 2: node dependency audit
+lint-test-node:
+  stage: lint-test-node
+  image: node:20
+  needs: []                                # runs in parallel with the python job
+  script:
+    - cd "$CI_PROJECT_DIR/applications-service"
+    - npm ci --omit=dev
+    - npm audit --omit=dev --audit-level=high
+    - cd "$CI_PROJECT_DIR/frontend"
+    - npm ci --omit=dev
+    - npm audit --omit=dev --audit-level=high
+
+# ───────────────────────────────────────────── stage 3: build all four images (once)
+build-images:
+  stage: build-images
+  extends: .docker
+  needs: [lint-test-python, lint-test-node]
+  script:
+    - *make-env
+    - docker compose build
+    - docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+    - mkdir -p images
+    - |
+      for svc in jobs-service applications-service frontend nginx; do
+        docker save "jobboard-$svc:latest" | gzip > "images/$svc.tar.gz"
+      done
+    - ls -lh images/
+  artifacts:
+    paths:
+      - images/
+    expire_in: 1 day
+
+# ───────────────────────────────────────────── stage 4: trivy scans (report-only gate)
+scan-images:
+  stage: scan-images
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs: [build-images]
+  script:
+    - mkdir -p reports
+    - |
+      for svc in jobs-service applications-service frontend; do
+        gunzip -c "images/$svc.tar.gz" > "/tmp/$svc.tar"
+        trivy image --input "/tmp/$svc.tar" \
+          --exit-code 0 \
+          --no-progress \
+          --format table \
+          --output "reports/trivy-$svc.txt"
+      done
+    - ls -la reports/
+  artifacts:
+    when: always
+    paths:
+      - reports/
+    expire_in: 1 week
+
+# ───────────────────────────────────────────── stage 5: integration test on the full stack
+integration-test:
+  stage: integration-test
+  extends: .docker
+  needs: [build-images]                    # runs in parallel with the scan
+  script:
+    - apk add --no-cache curl jq
+    - for f in images/*.tar.gz; do gunzip -c "$f" | docker load; done
+    - *make-env
+    - docker compose up -d --no-build
+    - |
+      echo "waiting for all five containers to be healthy"
+      ok=0
+      for i in $(seq 1 40); do
+        ok=1
+        for c in jobboard-db jobs-service applications-service jobboard-frontend nginx-proxy; do
+          st=$(docker inspect --format '{{.State.Health.Status}}' "$c" 2>/dev/null || echo missing)
+          [ "$st" = "healthy" ] || ok=0
+        done
+        [ "$ok" = 1 ] && break
+        sleep 5
+      done
+      docker compose ps
+      if [ "$ok" != 1 ]; then echo "timed out waiting for health"; exit 1; fi
+      echo "all healthy"
+    - |
+      set -e
+      BASE=http://docker:8080              # published ports live on the dind service
+
+      echo "1. seeded jobs are served"
+      curl -fsS "$BASE/api/jobs" | grep -q "Senior DevOps Engineer"
+
+      echo "2. creating a job returns 201"
+      code=$(curl -s -o /tmp/job.json -w '%{http_code}' -X POST "$BASE/api/jobs/" \
+        -H 'Content-Type: application/json' \
+        -d '{"title":"CI Test Job","description":"created by the pipeline","company":"CI","location":"Remote"}')
+      [ "$code" = "201" ]
+      JOB_ID=$(jq -r '.id' /tmp/job.json)
+
+      echo "3. the new job can be fetched back"
+      curl -fsS "$BASE/api/jobs/$JOB_ID" | grep -q "CI Test Job"
+
+      echo "4. submitting an application returns 201"
+      code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/applications/" \
+        -H 'Content-Type: application/json' \
+        -d "{\"job_id\":\"$JOB_ID\",\"applicant_name\":\"CI Bot\",\"applicant_email\":\"ci@example.com\"}")
+      [ "$code" = "201" ]
+
+      echo "5. the frontend is served through the proxy"
+      curl -fsS "$BASE/" | grep -q "JobBoard"
+
+      echo "all integration assertions passed"
+  after_script:
+    - if [ "$CI_JOB_STATUS" = "failed" ]; then docker compose logs; fi
+    - docker compose down -v
+
+# ───────────────────────────────────────────── stage 6: push (main only, never for merge requests)
+push-to-registry:
+  stage: push-to-registry
+  extends: .docker
+  needs:
+    - job: build-images
+      artifacts: true                      # the image tarballs
+    - job: scan-images
+      artifacts: false
+    - job: integration-test
+      artifacts: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - for f in images/*.tar.gz; do gunzip -c "$f" | docker load; done
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+    - |
+      for svc in jobs-service applications-service frontend nginx; do
+        docker tag "jobboard-$svc:latest" "$DOCKERHUB_USERNAME/jobboard-$svc:latest"
+        docker tag "jobboard-$svc:latest" "$DOCKERHUB_USERNAME/jobboard-$svc:$CI_COMMIT_SHA"
+        docker push "$DOCKERHUB_USERNAME/jobboard-$svc:latest"
+        docker push "$DOCKERHUB_USERNAME/jobboard-$svc:$CI_COMMIT_SHA"
+      done

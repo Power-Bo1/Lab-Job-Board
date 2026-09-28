@@ -1,0 +1,10 @@
+REPOSITORY                      TAG         SIZE
+jobboard-nginx                  latest      97.7MB
+jobboard-frontend               latest      98MB
+jobboard-jobs-service           latest      274MB
+jobboard-applications-service   latest      224MB
+hothaifaz11/k3s-exercise        job         208MB
+hothaifaz11/k3s-exercise        worker      208MB
+hothaifaz11/k3s-exercise        frontend    215MB
+hothaifaz11/k3s-exercise        backend     210MB
+postgres                        16-alpine   420MB
